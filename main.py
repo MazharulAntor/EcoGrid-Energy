@@ -405,3 +405,129 @@ class MarketplaceService:
         open_offers = sum(1 for o in self._offers.values() if o.status == "OPEN")
         return {"total_offers": len(self._offers), "open_offers": open_offers,
                 "total_matches": self._match_count}
+
+
+
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# BOUNDED CONTEXT 3: FINANCIAL SETTLEMENT SERVICE
+# ──────────────────────────────────────────────────────────────────────────────
+
+class SettlementService:
+    """
+    Handles all financial settlement for matched trades.
+    Implements the Choreography-based Saga pattern for distributed transactions.
+    All operations are idempotent — replay-safe.
+
+    Architecture note: This service ONLY subscribes to marketplace.events.
+    It has no knowledge of IoT devices or meter readings.
+    """
+
+    def __init__(self, bus: EventBus):
+        self._bus = bus
+        self._log = logging.getLogger("SettlementService")
+        self._wallets: Dict[str, WalletAccount] = {}
+        self._settlements: Dict[str, SettlementRecord] = {}
+        self._processed_match_ids: set = set()   # Idempotency guard
+
+        # Subscribe to Marketplace events (Saga trigger)
+        self._bus.subscribe(TOPIC_MARKETPLACE, self._on_marketplace_event, "settlement-service")
+
+    def register_household(self, household_id: str, initial_balance: float = 100.0):
+        """Register a household wallet for settlement."""
+        self._wallets[household_id] = WalletAccount(
+            household_id=household_id, balance_aud=initial_balance
+        )
+
+    def _on_marketplace_event(self, event: Dict):
+        """React to TradeMatched events – begin settlement Saga step."""
+        if event.get("eventType") == "TradeMatched":
+            self._settle_trade(event)
+
+    def _settle_trade(self, event: Dict):
+        """
+        Execute the financial settlement for a matched trade.
+        Idempotent: processing the same matchId twice has no effect.
+        Implements the Saga compensating transaction pattern.
+        """
+        match_id = event["matchId"]
+
+        # Idempotency check (Fitness Function: Settlement Idempotency)
+        if match_id in self._processed_match_ids:
+            self._log.warning("Duplicate matchId detected – skipping: %s", match_id)
+            return
+        self._processed_match_ids.add(match_id)
+
+        buyer_id  = event["buyerId"]
+        seller_id = event["sellerId"]
+        kwh       = event["kwhTraded"]
+        price     = event["agreedPricePerKwh"]
+        total_aud = round(kwh * price / 100, 4)   # convert cents to AUD
+
+        # Auto-register wallets if not exist (defensive)
+        for hid in [buyer_id, seller_id]:
+            if hid not in self._wallets:
+                self.register_household(hid)
+
+        buyer_wallet  = self._wallets[buyer_id]
+        seller_wallet = self._wallets[seller_id]
+
+        # Saga Step: Debit buyer
+        if buyer_wallet.balance_aud < total_aud:
+            self._log.warning(
+                "Settlement FAILED: insufficient funds for buyer %s (balance=%.2f needed=%.4f)",
+                buyer_id, buyer_wallet.balance_aud, total_aud
+            )
+            # Compensating transaction: publish SettlementFailed
+            self._bus.publish(TOPIC_SETTLEMENT, {
+                "eventType": "SettlementFailed",
+                "matchId": match_id,
+                "reason": "INSUFFICIENT_FUNDS",
+                "buyerId": buyer_id
+            })
+            return
+
+        # Execute financial transfer
+        buyer_wallet.balance_aud  = round(buyer_wallet.balance_aud  - total_aud, 4)
+        seller_wallet.balance_aud = round(seller_wallet.balance_aud + total_aud, 4)
+
+        record = SettlementRecord(
+            match_id=match_id,
+            seller_id=seller_id,
+            buyer_id=buyer_id,
+            kwh_traded=kwh,
+            price_per_kwh=price,
+            total_amount_aud=total_aud,
+            status="CONFIRMED"
+        )
+        self._settlements[record.settlement_id] = record
+
+        self._log.info(
+            "Settlement CONFIRMED | matchId=%s buyer=%s seller=%s %.3fkWh AUD$%.4f",
+            match_id, buyer_id, seller_id, kwh, total_aud
+        )
+        self._log.info(
+            "Wallets updated | buyer %s: $%.2f → $%.2f | seller %s: $%.2f → $%.2f",
+            buyer_id,
+            buyer_wallet.balance_aud + total_aud, buyer_wallet.balance_aud,
+            seller_id,
+            seller_wallet.balance_aud - total_aud, seller_wallet.balance_aud
+        )
+
+        # Publish SettlementConfirmed (Saga step 3 – notifies Marketplace)
+        self._bus.publish(TOPIC_SETTLEMENT, {
+            "eventType": "SettlementConfirmed",
+            "settlementId": record.settlement_id,
+            "matchId": match_id,
+            "sellerId": seller_id,
+            "buyerId": buyer_id,
+            "kwhTraded": kwh,
+            "totalAmountAud": total_aud
+        })
+
+    def get_wallet(self, household_id: str) -> Optional[WalletAccount]:
+        return self._wallets.get(household_id)
+
+    def get_audit_trail(self) -> List[SettlementRecord]:
+        return list(self._settlements.values())
