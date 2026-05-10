@@ -159,3 +159,100 @@ class WalletAccount:
     """Entity – Financial Settlement Bounded Context."""
     household_id: str
     balance_aud: float = 100.0        # Starting balance in AUD
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# BOUNDED CONTEXT 1: IoT INGESTION SERVICE
+# ──────────────────────────────────────────────────────────────────────────────
+
+class IoTIngestionService:
+    """
+    Responsible for real-time ingestion of smart meter data.
+    Publishes validated readings to the 'meter.readings' Kafka topic.
+    Monitors device health and publishes device status events.
+
+    Architecture note: This service has NO knowledge of Marketplace or Settlement.
+    It only knows about devices and readings.
+    """
+
+    def __init__(self, bus: EventBus):
+        self._bus = bus
+        self._log = logging.getLogger("IoTIngestionService")
+        self._device_registry: Dict[str, datetime] = {}  # deviceId → last_seen
+        self._ingestion_count = 0
+        self._start_time = time.time()
+
+    def register_device(self, device_id: str, household_id: str):
+        """Register a smart meter device."""
+        self._device_registry[device_id] = datetime.now(timezone.utc)
+        self._log.info("Device registered: %s → household %s", device_id, household_id)
+
+    def ingest_reading(self, device_id: str, household_id: str,
+                       kwh_generated: float, kwh_consumed: float):
+        """
+        Validate and ingest a meter reading.
+        Publishes MeterReadingReceived event to event bus.
+        Fitness Function: p99 publish latency must be < 100ms.
+        """
+        t0 = time.perf_counter()
+
+        # Validation (Anti-Corruption Layer)
+        if kwh_generated < 0 or kwh_consumed < 0:
+            self._log.warning("Invalid reading rejected from device %s", device_id)
+            return
+        if device_id not in self._device_registry:
+            self._log.warning("Unknown device %s – registering automatically", device_id)
+            self.register_device(device_id, household_id)
+
+        reading = MeterReading(
+            device_id=device_id,
+            household_id=household_id,
+            kwh_generated=round(kwh_generated, 4),
+            kwh_consumed=round(kwh_consumed, 4)
+        )
+
+        # Update heartbeat
+        self._device_registry[device_id] = datetime.now(timezone.utc)
+
+        # Publish domain event to Kafka topic
+        event = {
+            "eventType": "MeterReadingReceived",
+            "deviceId": device_id,
+            "householdId": household_id,
+            "kwhGenerated": reading.kwh_generated,
+            "kwhConsumed": reading.kwh_consumed,
+            "surplusKwh": reading.surplus_kwh,
+            "deficitKwh": reading.deficit_kwh,
+            "timestamp": reading.timestamp,
+        }
+        self._bus.publish(TOPIC_METER_READINGS, event)
+        self._ingestion_count += 1
+
+        latency_ms = (time.perf_counter() - t0) * 1000
+        self._log.info(
+            "Reading ingested | device=%s surplus=%.3fkWh deficit=%.3fkWh latency=%.2fms",
+            device_id, reading.surplus_kwh, reading.deficit_kwh, latency_ms
+        )
+
+    def simulate_burst(self, n_devices: int = 10, readings_per_device: int = 5):
+        """Simulate high-frequency IoT burst to validate scalability."""
+        self._log.info("Simulating burst: %d devices × %d readings", n_devices, readings_per_device)
+        t0 = time.perf_counter()
+        for i in range(n_devices):
+            did = f"METER-{i:04d}"
+            hid = f"HH-{i:04d}"
+            self.register_device(did, hid)
+            for _ in range(readings_per_device):
+                self.ingest_reading(
+                    did, hid,
+                    kwh_generated=round(random.uniform(0.1, 5.0), 3),
+                    kwh_consumed=round(random.uniform(0.05, 4.5), 3)
+                )
+        elapsed = time.perf_counter() - t0
+        rate = (n_devices * readings_per_device) / elapsed
+        self._log.info(
+            "Burst complete: %d readings in %.3fs = %.1f readings/sec",
+            n_devices * readings_per_device, elapsed, rate
+        )
+        return rate
+
