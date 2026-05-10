@@ -666,3 +666,88 @@ class FitnessFunctionRunner:
         for name, result in self.results.items():
             self._log.info("  [%s] %s", "PASS" if result else "FAIL", name)
         self._log.info("=" * 60)
+
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MAIN DEMO
+# ──────────────────────────────────────────────────────────────────────────────
+
+def main():
+    print("\n" + "=" * 70)
+    print("  EcoGrid Energy – P2P Renewable Energy Trading Platform")
+    print("  ICT711 Advanced Software Engineering – Assessment 2")
+    print("=" * 70 + "\n")
+
+    # ── Initialise services (each represents a microservice deployment) ───────
+    iot         = IoTIngestionService(event_bus)
+    marketplace = MarketplaceService(event_bus)
+    settlement  = SettlementService(event_bus)
+
+    # ── Register households and wallets ───────────────────────────────────────
+    households = {
+        "HH-001": {"name": "Smith (Solar Surplus)",  "initial_balance": 50.0},
+        "HH-002": {"name": "Jones (Buyer)",          "initial_balance": 80.0},
+        "HH-003": {"name": "Lee (Solar + Consumer)", "initial_balance": 60.0},
+        "HH-004": {"name": "Patel (Buyer)",          "initial_balance": 90.0},
+    }
+    for hid, info in households.items():
+        iot.register_device(f"METER-{hid}", hid)
+        settlement.register_household(hid, info["initial_balance"])
+
+    print("\n── Phase 1: IoT Meter Reading Ingestion ────────────────────────────\n")
+    # Simulate smart meter readings – these trigger automatic offer creation
+    meter_data = [
+        ("METER-HH-001", "HH-001", 4.2, 1.5),   # Smith: big solar surplus
+        ("METER-HH-002", "HH-002", 0.3, 3.8),   # Jones: big deficit (buyer)
+        ("METER-HH-003", "HH-003", 2.5, 1.8),   # Lee:   small surplus
+        ("METER-HH-004", "HH-004", 0.1, 2.9),   # Patel: big deficit (buyer)
+    ]
+    for device_id, hid, gen, con in meter_data:
+        iot.ingest_reading(device_id, hid, gen, con)
+        time.sleep(0.05)
+
+    print("\n── Phase 2: Marketplace State ──────────────────────────────────────\n")
+    stats = marketplace.get_stats()
+    print(f"  Total offers created : {stats['total_offers']}")
+    print(f"  Open offers          : {stats['open_offers']}")
+    print(f"  Matches executed     : {stats['total_matches']}")
+
+    print("\n── Phase 3: Settlement Audit Trail ─────────────────────────────────\n")
+    audit = settlement.get_audit_trail()
+    if audit:
+        for r in audit:
+            print(f"  ✓ Settlement {r.settlement_id[:8]}... | "
+                  f"seller={r.seller_id} buyer={r.buyer_id} "
+                  f"{r.kwh_traded:.3f}kWh AUD${r.total_amount_aud:.4f} [{r.status}]")
+    else:
+        print("  No settlements recorded yet.")
+
+    print("\n── Phase 4: Wallet Balances After Trading ──────────────────────────\n")
+    for hid, info in households.items():
+        wallet = settlement.get_wallet(hid)
+        if wallet:
+            change = wallet.balance_aud - info["initial_balance"]
+            arrow = "▲" if change >= 0 else "▼"
+            print(f"  {hid} ({info['name'][:20]:20s}) "
+                  f"Balance: ${wallet.balance_aud:.4f} "
+                  f"({arrow} ${abs(change):.4f})")
+
+    print("\n── Phase 5: Fitness Function Validation ────────────────────────────\n")
+    ff_runner = FitnessFunctionRunner(iot, marketplace, settlement, event_bus)
+    ff_runner.run_all()
+
+    print("\n── Phase 6: Kafka Event Log (last 5 events) ────────────────────────\n")
+    all_events = event_bus._event_log[-5:]
+    for entry in all_events:
+        e = entry["event"]
+        print(f"  [{entry['topic']:30s}] {e.get('eventType','—'):30s} @ {e.get('publishedAt','')[:19]}")
+
+    print("\n" + "=" * 70)
+    print("  Demo complete. All bounded contexts operated via event bus only.")
+    print("  No synchronous calls crossed bounded context boundaries.")
+    print("=" * 70 + "\n")
+
+
+if __name__ == "__main__":
+    main()
