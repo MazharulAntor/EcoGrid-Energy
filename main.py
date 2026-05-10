@@ -531,3 +531,138 @@ class SettlementService:
 
     def get_audit_trail(self) -> List[SettlementRecord]:
         return list(self._settlements.values())
+
+
+
+
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# FITNESS FUNCTION RUNNER
+# ──────────────────────────────────────────────────────────────────────────────
+
+class FitnessFunctionRunner:
+    """
+    Executes automated fitness functions to verify architectural characteristics.
+    These correspond to the fitness functions defined in Section 4b of the report.
+    In a real CI/CD pipeline, these would run as pytest tests in GitHub Actions.
+    """
+
+    def __init__(self, iot: IoTIngestionService, marketplace: MarketplaceService,
+                 settlement: SettlementService, bus: EventBus):
+        self._iot = iot
+        self._marketplace = marketplace
+        self._settlement = settlement
+        self._bus = bus
+        self._log = logging.getLogger("FitnessFunctions")
+        self.results: Dict[str, bool] = {}
+
+    def run_all(self):
+        self._log.info("=" * 60)
+        self._log.info("RUNNING FITNESS FUNCTIONS")
+        self._log.info("=" * 60)
+        self._ff_ingestion_latency()
+        self._ff_settlement_idempotency()
+        self._ff_no_cross_boundary_sync_calls()
+        self._ff_iot_burst_throughput()
+        self._summarise()
+
+    def _ff_ingestion_latency(self):
+        """FF1: IoT ingestion p99 latency must be < 100ms."""
+        name = "IoT Ingestion Latency (p99 < 100ms)"
+        latencies = []
+        for i in range(50):
+            t0 = time.perf_counter()
+            self._iot.ingest_reading(
+                f"FF-DEVICE-{i}", f"FF-HH-{i}",
+                kwh_generated=random.uniform(0.1, 3.0),
+                kwh_consumed=random.uniform(0.05, 2.5)
+            )
+            latencies.append((time.perf_counter() - t0) * 1000)
+        latencies.sort()
+        p99 = latencies[int(len(latencies) * 0.99)]
+        passed = p99 < 100.0
+        self._log.info("  [%s] %s | p99=%.2fms", "PASS" if passed else "FAIL", name, p99)
+        self.results[name] = passed
+
+    def _ff_settlement_idempotency(self):
+        """FF5: Replaying same TradeMatched event twice must not create duplicate settlement."""
+        name = "Settlement Idempotency"
+        match_id = str(uuid.uuid4())
+        self._settlement.register_household("FF-SELLER", 200.0)
+        self._settlement.register_household("FF-BUYER", 200.0)
+        event = {
+            "eventType": "TradeMatched",
+            "matchId": match_id,
+            "sellOfferId": str(uuid.uuid4()),
+            "buyOfferId": str(uuid.uuid4()),
+            "sellerId": "FF-SELLER",
+            "buyerId": "FF-BUYER",
+            "kwhTraded": 1.0,
+            "agreedPricePerKwh": 29.0
+        }
+        # Publish same event twice (simulates at-least-once delivery)
+        self._bus.publish(TOPIC_MARKETPLACE, event)
+        self._bus.publish(TOPIC_MARKETPLACE, {**event, "eventId": event.get("eventId", match_id)})
+
+        # Count settlements for this matchId
+        count = sum(1 for s in self._settlement.get_audit_trail() if s.match_id == match_id)
+        passed = count == 1
+        self._log.info(
+            "  [%s] %s | settlements for matchId=%s: %d",
+            "PASS" if passed else "FAIL", name, match_id, count
+        )
+        self.results[name] = passed
+
+    def _ff_no_cross_boundary_sync_calls(self):
+        """
+        FF7: Verify no synchronous HTTP calls exist between bounded contexts.
+        In this demo, this is guaranteed structurally: all cross-context
+        communication goes through the EventBus. We verify by checking that
+        IoTIngestionService has no reference to MarketplaceService and vice versa.
+        """
+        name = "No Cross-Boundary Synchronous Calls"
+        import inspect
+        iot_src = inspect.getsource(IoTIngestionService)
+        marketplace_src = inspect.getsource(MarketplaceService)
+        settlement_src = inspect.getsource(SettlementService)
+
+        violations = []
+        if "MarketplaceService" in iot_src or "SettlementService" in iot_src:
+            violations.append("IoTIngestionService imports Marketplace or Settlement")
+        if "IoTIngestionService" in marketplace_src or "SettlementService" in marketplace_src:
+            # Allowed: MarketplaceService subscribes to settlement events (via event bus, not direct)
+            if "IoTIngestionService" in marketplace_src:
+                violations.append("MarketplaceService imports IoTIngestionService")
+        if "MarketplaceService" in settlement_src or "IoTIngestionService" in settlement_src:
+            violations.append("SettlementService imports Marketplace or IoT")
+
+        passed = len(violations) == 0
+        self._log.info(
+            "  [%s] %s | violations=%d",
+            "PASS" if passed else "FAIL", name, len(violations)
+        )
+        if violations:
+            for v in violations:
+                self._log.warning("    VIOLATION: %s", v)
+        self.results[name] = passed
+
+    def _ff_iot_burst_throughput(self):
+        """FF: IoT burst throughput must handle > 50 readings/second."""
+        name = "IoT Burst Throughput (> 50 readings/sec)"
+        rate = self._iot.simulate_burst(n_devices=20, readings_per_device=5)
+        passed = rate > 50.0
+        self._log.info(
+            "  [%s] %s | rate=%.1f readings/sec",
+            "PASS" if passed else "FAIL", name, rate
+        )
+        self.results[name] = passed
+
+    def _summarise(self):
+        self._log.info("=" * 60)
+        passed = sum(1 for v in self.results.values() if v)
+        total  = len(self.results)
+        self._log.info("FITNESS FUNCTIONS: %d/%d PASSED", passed, total)
+        for name, result in self.results.items():
+            self._log.info("  [%s] %s", "PASS" if result else "FAIL", name)
+        self._log.info("=" * 60)
