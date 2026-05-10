@@ -256,3 +256,152 @@ class IoTIngestionService:
         )
         return rate
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# BOUNDED CONTEXT 2: MARKETPLACE SERVICE
+# ──────────────────────────────────────────────────────────────────────────────
+
+class MarketplaceService:
+    """
+    Manages the P2P energy trading marketplace.
+    Matches SELL offers from solar households with BUY offers from consuming households.
+    Publishes TradeMatched events when a match is found.
+
+    Architecture note: This service subscribes to meter.readings events.
+    It does NOT call the IoT service directly (no synchronous coupling).
+    """
+
+    def __init__(self, bus: EventBus):
+        self._bus = bus
+        self._log = logging.getLogger("MarketplaceService")
+        self._offers: Dict[str, TradeOffer] = {}
+        self._matches: Dict[str, TradeMatch] = {}
+        self._household_surplus: Dict[str, float] = {}   # householdId → surplus kWh
+        self._household_deficit: Dict[str, float] = {}   # householdId → deficit kWh
+        self._match_count = 0
+
+        # Subscribe to IoT readings (Conformist relationship via event bus)
+        self._bus.subscribe(TOPIC_METER_READINGS, self._on_meter_reading, "marketplace-service")
+        # Subscribe to settlement outcomes
+        self._bus.subscribe(TOPIC_SETTLEMENT, self._on_settlement_event, "marketplace-service")
+
+    # ── Event Handlers ──────────────────────────────────────────────────────
+
+    def _on_meter_reading(self, event: Dict):
+        """
+        React to MeterReadingReceived events.
+        Update known surplus/deficit per household and auto-generate offers.
+        This is the Anti-Corruption Layer: translate IoT event to Marketplace model.
+        """
+        hid = event["householdId"]
+        surplus = event["surplusKwh"]
+        deficit = event["deficitKwh"]
+        self._household_surplus[hid] = surplus
+        self._household_deficit[hid] = deficit
+
+        # Auto-generate sell offer if surplus exists
+        if surplus > 0.1:
+            self.create_offer(hid, "SELL", surplus, price_per_kwh=28.5, grid_zone="ZONE-A")
+        # Auto-generate buy offer if deficit exists
+        if deficit > 0.1:
+            self.create_offer(hid, "BUY", deficit, price_per_kwh=30.0, grid_zone="ZONE-A")
+
+    def _on_settlement_event(self, event: Dict):
+        """React to SettlementConfirmed or SettlementFailed events (Saga step)."""
+        match_id = event.get("matchId")
+        status = event.get("eventType")
+        if match_id in self._matches:
+            match = self._matches[match_id]
+            if status == "SettlementConfirmed":
+                match.status = "SETTLED"
+                self._log.info("Trade SETTLED | matchId=%s", match_id)
+            elif status == "SettlementFailed":
+                # Compensating transaction: revert offers
+                match.status = "SETTLEMENT_FAILED"
+                self._log.warning(
+                    "Settlement FAILED for matchId=%s – compensating: offers reverted", match_id
+                )
+
+    # ── Domain Operations ────────────────────────────────────────────────────
+
+    def create_offer(self, household_id: str, offer_type: str,
+                     kwh_amount: float, price_per_kwh: float, grid_zone: str) -> TradeOffer:
+        """Create and register a trade offer."""
+        offer = TradeOffer(
+            household_id=household_id,
+            offer_type=offer_type,
+            kwh_amount=kwh_amount,
+            price_per_kwh=price_per_kwh,
+            grid_zone=grid_zone
+        )
+        self._offers[offer.offer_id] = offer
+        self._log.info(
+            "Offer created | type=%s household=%s %.3fkWh @ %.1f¢/kWh",
+            offer_type, household_id, kwh_amount, price_per_kwh
+        )
+        # Attempt matching after each new offer
+        self._attempt_matching()
+        return offer
+
+    def _attempt_matching(self):
+        """
+        Matching Engine: pair SELL and BUY offers in the same grid zone.
+        Uses a simple price-priority algorithm (lowest sell price, highest buy price).
+        """
+        open_sells = sorted(
+            [o for o in self._offers.values() if o.offer_type == "SELL" and o.status == "OPEN"],
+            key=lambda o: o.price_per_kwh
+        )
+        open_buys = sorted(
+            [o for o in self._offers.values() if o.offer_type == "BUY" and o.status == "OPEN"],
+            key=lambda o: -o.price_per_kwh
+        )
+
+        for sell in open_sells:
+            for buy in open_buys:
+                if (buy.status != "OPEN" or sell.status != "OPEN"):
+                    continue
+                if sell.grid_zone != buy.grid_zone:
+                    continue
+                if sell.household_id == buy.household_id:
+                    continue
+                # Price agreement: buyer willing to pay >= seller asking price
+                if buy.price_per_kwh >= sell.price_per_kwh:
+                    kwh_traded = min(sell.kwh_amount, buy.kwh_amount)
+                    agreed_price = (sell.price_per_kwh + buy.price_per_kwh) / 2
+
+                    match = TradeMatch(
+                        sell_offer_id=sell.offer_id,
+                        buy_offer_id=buy.offer_id,
+                        seller_id=sell.household_id,
+                        buyer_id=buy.household_id,
+                        kwh_traded=round(kwh_traded, 4),
+                        agreed_price_per_kwh=round(agreed_price, 2)
+                    )
+                    self._matches[match.match_id] = match
+                    sell.status = "MATCHED"
+                    buy.status = "MATCHED"
+                    self._match_count += 1
+
+                    self._log.info(
+                        "MATCH! seller=%s buyer=%s %.3fkWh @ %.2f¢/kWh | matchId=%s",
+                        sell.household_id, buy.household_id,
+                        kwh_traded, agreed_price, match.match_id
+                    )
+
+                    # Publish TradeMatched domain event (triggers Settlement Saga)
+                    self._bus.publish(TOPIC_MARKETPLACE, {
+                        "eventType": "TradeMatched",
+                        "matchId": match.match_id,
+                        "sellOfferId": sell.offer_id,
+                        "buyOfferId": buy.offer_id,
+                        "sellerId": sell.household_id,
+                        "buyerId": buy.household_id,
+                        "kwhTraded": kwh_traded,
+                        "agreedPricePerKwh": agreed_price
+                    })
+
+    def get_stats(self) -> Dict:
+        open_offers = sum(1 for o in self._offers.values() if o.status == "OPEN")
+        return {"total_offers": len(self._offers), "open_offers": open_offers,
+                "total_matches": self._match_count}
